@@ -259,7 +259,7 @@ static int setup_idmap(uid_t real_uid, gid_t real_gid)
 
 static int bind_mount(const char *src, const char *dst)
 {
-	if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) < 0) {
+	if (mount(src, dst, NULL, MS_BIND|MS_REC, NULL) < 0) {
 		fprintf(stderr, "launcher: bind mount %s -> %s: %s\n",
 			src, dst, strerror(errno));
 		return -1;
@@ -284,7 +284,8 @@ static void lazy_umount(const char *path)
  * ========================================================================= */
 int main(int argc, char *argv[])
 {
-	static const char *bmounts[] = { "/dev", "/proc", "/tmp/.X11-unix" };
+	static const char *bmounts[] = { "/dev", "/proc", "/tmp/.X11-unix", "/root" };
+	const char* homedir = getenv("HOME");
 
 	const char *image;
 	const char *mountpoint;
@@ -518,9 +519,10 @@ int main(int argc, char *argv[])
 		 */
 		for (int i = 0; i < sizeof(bmounts) / sizeof(bmounts[0]); ++i) {
 			char dst[PATH_MAX];
-			snprintf(dst, sizeof(dst), "%s/%s", mountpoint,
+			int is_root = !strcmp(bmounts[i], "/root");
+			snprintf(dst, sizeof(dst), "%s%s", mountpoint,
 				 bmounts[i]);
-			if (bind_mount(bmounts[i], dst) < 0)
+			if (bind_mount(is_root ? homedir : bmounts[i], dst) < 0)
 				fprintf(stderr,
 					"launcher: warning: %s bind mount failed\n",
 					bmounts[i]);
@@ -535,6 +537,7 @@ int main(int argc, char *argv[])
 			perror("launcher: chdir /");
 			_exit(127);
 		}
+		setenv("HOME", "/root", 1);
 
 		/* Exec the requested command. */
 		execvp(cmd[0], cmd);
