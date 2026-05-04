@@ -1,7 +1,8 @@
 /*
  * launcher.c – squashfs container launcher
  *
- * Usage: launcher <squashfs.img> <mountpoint> <command> [args...]
+ * Usage: prepend to a squashfs.img (via makeapp). starts the specified
+ * command inside the rootfs while passing all command line args to it.
  *
  * Behaviour:
  *   1. Unshares user + mount namespaces (no host root required).
@@ -28,7 +29,7 @@
  *
  *   For FUSE 3.x replace FUSE_USE_VERSION=26 with 30 and link libfuse3.a.
  *
- * The mountpoint directory must already exist.
+ * The mountpoint directory is created on the fly.
  */
 
 /* ---- FUSE version selection -------------------------------------------- */
@@ -36,10 +37,8 @@
 # define FUSE_USE_VERSION 26
 #endif
 
-/* ---- feature-test macros ------------------------------------------------ */
 #define _GNU_SOURCE		/* unshare, MNT_DETACH, pipe2 */
 
-/* ---- standard headers --------------------------------------------------- */
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>		/* PATH_MAX */
@@ -55,45 +54,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* ---- squashfuse public headers ------------------------------------------ */
-/*
- * squashfuse.h aggregates: dir.h  file.h  fs.h  traverse.h  util.h  xattr.h
- * ll.h   declares: sqfs_ll, sqfs_ll_chan, sqfs_ll_op_*, sqfs_ll_mount/unmount,
- *                  sqfs_ll_open_with_subdir, sqfs_ll_destroy, …
- */
+struct BinConfig {
+	off_t squash_start;
+	char* command;
+	int disable_net;
+	int disable_home;
+	int disable_x11;
+};
+
 #include "squashfuse.h"
 #include "ll.h"
 
-/* =========================================================================
- * Declarations for symbols that live in libsquashfuse.a but are NOT
- * exported through any installed public header (they come from
- * fuseprivate.h / ll.c / fuseprivate.c).
- *
- * We do NOT call any of these directly from this file – they are called
- * by the sqfs_ll_op_* callbacks that are already compiled into the
- * library.  The declarations are reproduced here purely to satisfy the
- * compiler when this file is built outside the squashfuse source tree.
- * ========================================================================= */
-
-/* fuseprivate.h – mount-ready notification characters */
-#define NOTIFY_SUCCESS 's'
-#define NOTIFY_FAILURE 'f'
-
-/*
- * The following three functions are referenced by the compiled
- * sqfs_ll_op_* routines inside libsquashfuse.a.  Because this
- * translation unit never calls them directly, forward declarations
- * are not strictly required; they are shown here for clarity only.
- *
- *   int  sqfs_listxattr(sqfs *, sqfs_inode *, char *, size_t *);
- *   int  sqfs_statfs(sqfs *, struct statvfs *);
- *   void notify_mount_ready_async(const char *notify_pipe, char status);
- *   int  sqfs_enoattr(void);
- */
-
-/* =========================================================================
- * Global state shared between main() and signal handlers
- * ========================================================================= */
+/* Global state shared between main() and signal handlers */
 
 /* PID of the child that runs the user's command. */
 static volatile pid_t g_child_pid = -1;
@@ -107,25 +79,20 @@ static volatile sig_atomic_t g_child_done = 0;
 /* Propagated exit code of the child process. */
 static volatile sig_atomic_t g_exit_status = 0;
 
-/*
- * Write end of the "FUSE loop is live" pipe.
- * Written from launcher_ll_op_init() (called by fuse_session_loop in the
- * parent when it processes the kernel's initial FUSE_INIT handshake).
- * Set to -1 once used.
- */
+/* Write end of the "FUSE loop is live" pipe.
+   Written from launcher_ll_op_init() (called by fuse_session_loop in the
+   parent when it processes the kernel's initial FUSE_INIT handshake).
+   Set to -1 once used. */
 static int g_fuse_ready_wfd = -1;
 
-/* =========================================================================
- * FUSE init wrapper
- *
- * Replaces ops.init so we can signal the child that the FUSE event loop
- * has started and is ready to serve requests (i.e. bind-mount lookups
- * into the squashfs mountpoint will now succeed).
- * ========================================================================= */
+/* FUSE init wrapper
+   Replaces ops.init so we can signal the child that the FUSE event loop
+   has started and is ready to serve requests (i.e. bind-mount lookups
+   into the squashfs mountpoint will now succeed). */
 static void launcher_ll_op_init(void *userdata, struct fuse_conn_info *conn)
 {
 	/* Let squashfuse do its own initialisation first (sends notify_pipe
-	 * if one was configured, etc.). */
+	   if one was configured, etc.). */
 	sqfs_ll_op_init(userdata, conn);
 
 	/* Unblock the child. */
@@ -137,15 +104,11 @@ static void launcher_ll_op_init(void *userdata, struct fuse_conn_info *conn)
 	}
 }
 
-/* =========================================================================
- * Signal handlers
- * ========================================================================= */
+/* Signal handlers */
 
-/*
- * SIGCHLD – reap the child non-blockingly, record its exit status, and
- * ask the FUSE loop to stop.  No SA_RESTART: we rely on EINTR to wake
- * the blocking read() inside fuse_session_loop().
- */
+/* SIGCHLD – reap the child non-blockingly, record its exit status, and
+   ask the FUSE loop to stop.  No SA_RESTART: we rely on EINTR to wake
+   the blocking read() inside fuse_session_loop(). */
 static void sigchld_handler(int sig)
 {
 	int status;
@@ -165,10 +128,8 @@ static void sigchld_handler(int sig)
 	}
 }
 
-/*
- * SIGINT / SIGTERM – forward to the child, then stop the FUSE loop.
- * No SA_RESTART for the same reason as above.
- */
+/* SIGINT / SIGTERM – forward to the child, then stop the FUSE loop.
+   No SA_RESTART for the same reason as above.  */
 static void sigterm_handler(int sig)
 {
 	(void)sig;
@@ -199,10 +160,6 @@ static void setup_signals(void)
 	sigaction(SIGTERM, &sa, NULL);
 }
 
-/* =========================================================================
- * Namespace helpers
- * ========================================================================= */
-
 /* Write a NUL-terminated string to a file; return 0 on success. */
 static int write_file(const char *path, const char *content)
 {
@@ -218,20 +175,16 @@ static int write_file(const char *path, const char *content)
 	return (n == (ssize_t) len) ? 0 : -1;
 }
 
-/*
- * Map the caller's real uid/gid to uid 0 / gid 0 inside the newly
- * created user namespace, making us "root" within it.  This is
- * required before calling mount(2).
- */
+/* Map the caller's real uid/gid to uid 0 / gid 0 inside the newly
+   created user namespace, making us "root" within it.  This is
+   required before calling mount(2). */
 static int setup_idmap(uid_t real_uid, gid_t real_gid)
 {
 	char buf[64];
 
-	/*
-	 * Linux 3.19+: writing gid_map is only allowed after writing "deny"
-	 * to setgroups.  Silently ignore errors on older kernels (ENOENT) or
-	 * when the write is not permitted for other reasons (EACCES).
-	 */
+	/* Linux 3.19+: writing gid_map is only allowed after writing "deny"
+	   to setgroups.  Silently ignore errors on older kernels (ENOENT) or
+	   when the write is not permitted for other reasons (EACCES). */
 	if (write_file("/proc/self/setgroups", "deny") < 0 &&
 	    errno != ENOENT && errno != EACCES) {
 		perror("write /proc/self/setgroups");
@@ -253,14 +206,10 @@ static int setup_idmap(uid_t real_uid, gid_t real_gid)
 	return 0;
 }
 
-/* =========================================================================
- * Mount helpers
- * ========================================================================= */
-
 static int bind_mount(const char *src, const char *dst)
 {
 	if (mount(src, dst, NULL, MS_BIND|MS_REC, NULL) < 0) {
-		fprintf(stderr, "launcher: bind mount %s -> %s: %s\n",
+		dprintf(2, "launcher: bind mount %s -> %s: %s\n",
 			src, dst, strerror(errno));
 		return -1;
 	}
@@ -269,25 +218,98 @@ static int bind_mount(const char *src, const char *dst)
 
 static void lazy_umount(const char *path)
 {
-	/*
-	 * MNT_DETACH: detach the mount from the filesystem hierarchy even if
+	/* MNT_DETACH: detach the mount from the filesystem hierarchy even if
 	 * it is busy; the mount point becomes invisible to new accesses.
-	 * Ignore EINVAL (not mounted) and ENOENT (path does not exist).
-	 */
+	 * Ignore EINVAL (not mounted) and ENOENT (path does not exist). */
 	if (umount2(path, MNT_DETACH) < 0 && errno != EINVAL && errno != ENOENT)
-		fprintf(stderr, "launcher: umount2 %s: %s\n", path,
-			strerror(errno));
+		dprintf(2, "launcher: umount2 %s: %s\n", path, strerror(errno));
 }
 
-/* =========================================================================
- * main
- * ========================================================================= */
+
+/* resolve binary path via argv0 only, lamers use /proc/self/exe.
+   if you don't have access to argv0, you can use program_invocation_name
+   instead. most libcs set that, but it's not posix:
+   extern char *program_invocation_name;
+   out needs to be of size PATH_MAX */
+void get_bin_path(char *a0, char* out) {
+    char tmp[PATH_MAX], *p;
+    if (!strchr(a0, '/') && (p = getenv ("PATH"))) {
+        for (;;) {
+            char *o = tmp;
+            size_t l = sizeof(tmp);
+            while (l && *p && *p != ':') {
+                *(o++) = *(p++);
+                l--;
+            }
+            snprintf (o, l, "/%s", a0);
+            if (access (tmp, X_OK) == 0) break; /* found it */
+            if (*p == ':') p++;
+            else if (!(*p)) break; /* program wasn't in PATH - can't happen */
+        }
+        a0 = tmp;
+    }
+    (void) realpath (a0, out); /* copy&resolve relative paths etc */
+}
+
+/* 10 line ini-parser - damn, too much work! should've added a dependency to
+   an external library instead! if only i had cargo ... */
+char* cfg_getstr(FILE *f, off_t startpos, const char *key, char*  buf, size_t bufsize) {
+	fseeko(f, startpos, SEEK_SET);
+	size_t l = strlen(key);
+	while(fgets(buf, bufsize, f)) {
+		if(!strncmp(buf, key, l) && buf[l] == '=') {
+			size_t x = l;
+			while(buf[++x] && buf[x] != '\n');
+			buf[x] = 0;
+			memmove(buf, buf + l + 1, x - l);
+			return buf;
+		}
+	}
+	*buf = 0;
+	return 0;
+}
+
+uint64_t cfg_getint(FILE *f, off_t startpos, const char *key) {
+	char buf[64];
+	char *res = cfg_getstr(f, startpos, key, buf, sizeof buf);
+	if(res) return strtoll(res, NULL, 10);
+	return 0;
+}
+
+int get_bin_config(FILE *bin, struct BinConfig *config) {
+	/* the binary assembly has a 64 bit offset in host endian format
+	   at the last 8 bytes, which points to the offset of the textual
+	   config. */
+	uint64_t config_off;
+	if (fseeko(bin, -8, SEEK_END) == -1) return 0;
+	if (fread(&config_off, 1, 8, bin) != 8) return 0;
+	if (fseeko(bin, config_off, SEEK_SET) == -1) return 0;
+	char buf[128], *res;
+	res = cfg_getstr(bin, config_off, "command", buf, sizeof buf);
+	if(!res) {
+		dprintf(2, "required config setting `command` not found\n");
+		return 0;
+	}
+	config->command = strdup(res);
+	config->squash_start = cfg_getint(bin, config_off, "squash_start");
+	if (!config->squash_start) {
+		dprintf(2, "required config setting `squash_start` not found\n");
+		return 0;
+	}
+	config->disable_net = cfg_getint(bin, config_off, "disable_net");
+	config->disable_x11 = cfg_getint(bin, config_off, "disable_x11");
+	config->disable_home = cfg_getint(bin, config_off, "disable_home");
+	return 1;
+}
+
 int main(int argc, char *argv[])
 {
 	static const char *bmounts[] = { "/dev", "/proc", "/tmp/.X11-unix", "/root" };
 	const char* homedir = getenv("HOME");
+	struct BinConfig binconfig = {0};
 
-	const char *image;
+	char image[PATH_MAX];
+	char template[] = "/tmp/sqLaunchXXXXXX";
 	const char *mountpoint;
 	char **cmd;
 	uid_t real_uid;
@@ -301,20 +323,14 @@ int main(int argc, char *argv[])
 	pid_t child = -1;
 	int exit_code = 1;
 
-	/* ------------------------------------------------------------------ */
-	if (argc < 4) {
-		fprintf(stderr,
-			"Usage: %s <squashfs.img> <mountpoint> <command> [args...]\n"
-			"\n"
-			"  Mounts <squashfs.img> at <mountpoint> inside a private\n"
-			"  user + mount namespace, then chroots and execs <command>.\n"
-			"  <mountpoint> must be a pre-existing directory.\n",
-			argv[0]);
+	get_bin_path(argv[0], image);
+	FILE *fimg = fopen(image, "rb");
+	if(!get_bin_config(fimg, &binconfig)) {
+		dprintf(2, "fatal: failed to open/locate binary config\n");
 		return 1;
 	}
-
-	image = argv[1];
-	mountpoint = argv[2];
+	fclose(fimg);
+	mountpoint = mkdtemp(template);
 	cmd = &argv[3];		/* cmd[0] = command, rest = arguments */
 
 	real_uid = getuid();
@@ -322,13 +338,10 @@ int main(int argc, char *argv[])
 
 	memset(&ch, 0, sizeof(ch));
 
-	/* ==================================================================
-	 * Step 1 – User namespace
-	 *
-	 * Must be done before the mount namespace: an unprivileged process
-	 * may only create a new mount namespace once it is root inside a
-	 * user namespace.
-	 * ================================================================== */
+	/* User namespace:
+	   Must be done before the mount namespace: an unprivileged process
+	   may only create a new mount namespace once it is root inside a
+	   user namespace. */
 	if (unshare(CLONE_NEWUSER) < 0) {
 		perror("launcher: unshare(CLONE_NEWUSER)");
 		return 1;
@@ -338,33 +351,30 @@ int main(int argc, char *argv[])
 	if (setup_idmap(real_uid, real_gid) < 0)
 		return 1;
 
-	/* ==================================================================
-	 * Step 2 – Mount namespace
-	 *
-	 * We now hold CAP_SYS_ADMIN inside the user namespace, so this
-	 * succeeds without any external privilege.
-	 * ================================================================== */
+	/* Mount namespace:
+	   We now hold CAP_SYS_ADMIN inside the user namespace, so this
+	   succeeds without any external privilege. */
 	if (unshare(CLONE_NEWNS) < 0) {
 		perror("launcher: unshare(CLONE_NEWNS)");
 		return 1;
 	}
 
-	/*
-	 * Make the entire inherited mount tree private so that none of our
-	 * subsequent bind mounts or FUSE mounts propagate back to the host.
-	 */
+	if (binconfig.disable_net && unshare(CLONE_NEWNET) < 0) {
+		perror("launcher: unshare(CLONE_NEWNET)");
+		return 1;
+	}
+
+	/* Make the entire inherited mount tree private so that none of our
+	   subsequent bind mounts or FUSE mounts propagate back to the host. */
 	if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
 		perror("launcher: mount --make-rprivate /");
 		return 1;
 	}
 
-	/* ==================================================================
-	 * Step 3 – Guard file-descriptor 0-2
-	 *
-	 * sqfs_ll_open_with_subdir opens the image file; if it were to get
-	 * fd 0, 1, or 2 it would later be clobbered.  Ensure those slots are
-	 * occupied before we open the image.
-	 * ================================================================== */
+	/*  Guard file-descriptor 0-2
+	   sqfs_ll_open_with_subdir opens the image file; if it were to get
+	   fd 0, 1, or 2 it would later be clobbered.  Ensure those slots are
+	   occupied before we open the image. */
 	for (;;) {
 		int fd = open("/dev/null", O_RDONLY);
 		if (fd < 0)
@@ -375,24 +385,18 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* ==================================================================
-	 * Step 4 – Open the squashfs image
-	 * ================================================================== */
-	ll = sqfs_ll_open_with_subdir(image, /*offset= */ 0, /*subdir= */ NULL);
+	/* Open the squashfs image */
+	ll = sqfs_ll_open_with_subdir(image, binconfig.squash_start, /*subdir= */ NULL);
 	if (!ll) {
-		fprintf(stderr, "launcher: cannot open squashfs image '%s'\n",
-			image);
+		dprintf(2, "launcher: cannot open squashfs image\n");
 		return 1;
 	}
 
-	/* ==================================================================
-	 * Step 5 – Build the FUSE low-level ops table
-	 *
-	 * We install our own init wrapper (launcher_ll_op_init) in place of
-	 * the stock sqfs_ll_op_init so that we can signal the child once the
-	 * FUSE event loop has processed the initial FUSE_INIT handshake.
-	 * Every other operation is the unmodified squashfuse implementation.
-	 * ================================================================== */
+	/* Build the FUSE low-level ops table
+	   We install our own init wrapper (launcher_ll_op_init) in place of
+	   the stock sqfs_ll_op_init so that we can signal the child once the
+	   FUSE event loop has processed the initial FUSE_INIT handshake.
+	   Every other operation is the unmodified squashfuse implementation.*/
 	memset(&ops, 0, sizeof(ops));
 	ops.getattr = sqfs_ll_op_getattr;
 	ops.opendir = sqfs_ll_op_opendir;
@@ -410,18 +414,14 @@ int main(int argc, char *argv[])
 	ops.statfs = stfs_ll_op_statfs;
 	ops.init = launcher_ll_op_init;	/* our wrapper */
 
-	/* ==================================================================
-	 * Step 6 – Mount the squashfs image via FUSE
-	 *
-	 * sqfs_ll_mount() opens /dev/fuse and issues mount(2) internally.
-	 * Because we hold CAP_SYS_ADMIN within the user namespace the kernel
-	 * honours mount(2) without requiring fusermount / fusermount3.
-	 *
-	 * We pass minimal FUSE args: program name + "-o ro".
-	 * fuse_mount (FUSE2) / fuse_session_mount (FUSE3) parse these for
-	 * their own option processing; we never call fuse_parse_cmdline
-	 * because we have our own argument layout.
-	 * ================================================================== */
+	/* Mount the squashfs image via FUSE
+	   sqfs_ll_mount() opens /dev/fuse and issues mount(2) internally.
+	   Because we hold CAP_SYS_ADMIN within the user namespace the kernel
+	   honours mount(2) without requiring fusermount / fusermount3.
+	   We pass minimal FUSE args: program name + "-o ro".
+	   fuse_mount (FUSE2) / fuse_session_mount (FUSE3) parse these for
+	   their own option processing; we never call fuse_parse_cmdline
+	   because we have our own argument layout. */
 	{
 		char *fuse_argv[] = { argv[0], "-o", "ro", NULL };
 		struct fuse_args fargs = FUSE_ARGS_INIT(3, fuse_argv);
@@ -430,16 +430,14 @@ int main(int argc, char *argv[])
 		sferr = sqfs_ll_mount(&ch, mountpoint, &fargs,
 				      &ops, sizeof(ops), ll);
 
-		/*
-		 * fargs.argv points into our stack array of literals; fuse_args
-		 * was initialised with allocated=0 so fuse_opt_free_args is a
-		 * no-op, but call it for correctness in case the library added
-		 * anything.
-		 */
+		/* fargs.argv points into our stack array of literals; fuse_args
+		   was initialised with allocated=0 so fuse_opt_free_args is a
+		   no-op, but call it for correctness in case the library added
+		   anything. */
 		fuse_opt_free_args(&fargs);
 
 		if (sferr != SQFS_OK) {
-			fprintf(stderr, "launcher: sqfs_ll_mount failed\n");
+			dprintf(2, "launcher: sqfs_ll_mount failed\n");
 			sqfs_ll_destroy(ll);
 			free(ll);
 			return 1;
@@ -449,32 +447,23 @@ int main(int argc, char *argv[])
 	/* Expose session pointer before any signal can arrive. */
 	g_session = ch.session;
 
-	/* ==================================================================
-	 * Step 7 – "FUSE loop is live" pipe
-	 *
-	 * The child blocks on read(pipefd[0]) until the parent's init
-	 * callback fires (the very first thing fuse_session_loop processes).
-	 * Only then does the child perform bind mounts, since those trigger
-	 * FUSE lookups that need the loop to be running.
-	 * ================================================================== */
+	/* "FUSE loop is live" pipe
+	   The child blocks on read(pipefd[0]) until the parent's init
+	   callback fires (the very first thing fuse_session_loop processes).
+	   Only then does the child perform bind mounts, since those trigger
+	   FUSE lookups that need the loop to be running. */
 	if (pipe(pipefd) < 0) {
 		perror("launcher: pipe");
 		goto out_unmount;
 	}
 	g_fuse_ready_wfd = pipefd[1];	/* closed in launcher_ll_op_init */
 
-	/* ==================================================================
-	 * Step 8 – Signal handlers
-	 *
-	 * Install after g_session is set and the pipe is ready, but before
-	 * fork() so that the child process inherits default dispositions
-	 * (reset explicitly inside the child below).
-	 * ================================================================== */
+	/* Install Signal handler after g_session is set and the pipe is ready,
+	   but before fork() so that the child process inherits default
+	   dispositions (reset explicitly inside the child below). */
 	setup_signals();
 
-	/* ==================================================================
-	 * Step 9 – Fork
-	 * ================================================================== */
+	/* Fork */
 	child = fork();
 	if (child < 0) {
 		perror("launcher: fork");
@@ -485,9 +474,7 @@ int main(int argc, char *argv[])
 		goto out_unmount;
 	}
 
-	/* ------------------------------------------------------------------ *
-	 * CHILD                                                               *
-	 * ------------------------------------------------------------------ */
+	/* child code */
 	if (child == 0) {
 		char ready;
 
@@ -499,32 +486,29 @@ int main(int argc, char *argv[])
 		signal(SIGINT, SIG_DFL);
 		signal(SIGTERM, SIG_DFL);
 
-		/*
-		 * Wait until the parent's FUSE event loop has processed FUSE_INIT
-		 * and is ready to serve VFS requests.  Without this gate the bind
-		 * mounts below would dead-lock: the kernel would queue FUSE_LOOKUP
-		 * requests that nobody was reading yet.
-		 */
+		/* Wait until the parent's FUSE event loop has processed FUSE_INIT
+		   and is ready to serve VFS requests.  Without this gate the bind
+		   mounts below would dead-lock: the kernel would queue FUSE_LOOKUP
+		   requests that nobody was reading yet. */
 		if (read(pipefd[0], &ready, 1) < 1) {
-			fprintf(stderr,
-				"launcher child: FUSE-ready signal not received\n");
+			dprintf(2, "child: FUSE-ready signal not received\n");
 			_exit(127);
 		}
 		close(pipefd[0]);
 
-		/*
-		 * Bind-mount the host /dev and /proc into the squashfs image.
-		 * Failure is non-fatal: some images legitimately lack these
-		 * directories, and the user's command might not need them.
-		 */
+		/* Bind-mount the host /dev and /proc into the squashfs image.
+		   Failure is non-fatal: some images legitimately lack these
+		   directories, and the user's command might not need them. */
 		for (int i = 0; i < sizeof(bmounts) / sizeof(bmounts[0]); ++i) {
 			char dst[PATH_MAX];
 			int is_root = !strcmp(bmounts[i], "/root");
+			if (is_root && binconfig.disable_home) continue;
+			if (!is_root && binconfig.disable_x11 && !strcmp(bmounts[i], "/tmp/.X11-unix"))
+				continue;
 			snprintf(dst, sizeof(dst), "%s%s", mountpoint,
 				 bmounts[i]);
 			if (bind_mount(is_root ? homedir : bmounts[i], dst) < 0)
-				fprintf(stderr,
-					"launcher: warning: %s bind mount failed\n",
+				dprintf(2, "launcher: warning: %s bind mount failed\n",
 					bmounts[i]);
 		}
 
@@ -540,43 +524,35 @@ int main(int argc, char *argv[])
 		setenv("HOME", "/root", 1);
 
 		/* Exec the requested command. */
-		execvp(cmd[0], cmd);
-		fprintf(stderr, "launcher: execvp %s: %s\n",
-			cmd[0], strerror(errno));
+		argv[0] = binconfig.command;
+		execvp(argv[0], argv);
+		dprintf(2, "launcher: execvp %s: %s\n",	argv[0], strerror(errno));
 		_exit(127);
 	}
 
-	/* ------------------------------------------------------------------ *
-	 * PARENT                                                              *
-	 * ------------------------------------------------------------------ */
+	/* parent code */
 	g_child_pid = child;
 
 	/* Close the read end of the pipe; the child owns it now.
-	 * The write end (g_fuse_ready_wfd / pipefd[1]) is closed inside
-	 * launcher_ll_op_init() once we write the "go" byte. */
+	   The write end (g_fuse_ready_wfd / pipefd[1]) is closed inside
+	   launcher_ll_op_init() once we write the "go" byte. */
 	close(pipefd[0]);
 	pipefd[0] = -1;
 
-	/* ==================================================================
-	 * Step 10 – FUSE event loop
-	 *
-	 * Blocks here serving squashfs FUSE requests until:
-	 *   - SIGCHLD fires (child exited) → sigchld_handler calls
-	 *     fuse_session_exit(), which sets the exit flag.  EINTR from
-	 *     the signal unblocks the internal read() and the loop checks
-	 *     the flag on the next iteration.
-	 *   - SIGINT / SIGTERM fires → sigterm_handler kills the child
-	 *     and calls fuse_session_exit().
-	 *   - The kernel closes the FUSE device (e.g. forced unmount).
-	 * ================================================================== */
+	/* FUSE event loop:
+	   Blocks here serving squashfs FUSE requests until:
+	   - SIGCHLD fires (child exited) : sigchld_handler calls
+	     fuse_session_exit(), which sets the exit flag.  EINTR from
+	     the signal unblocks the internal read() and the loop checks
+	     the flag on the next iteration.
+	   - SIGINT / SIGTERM fires : sigterm_handler kills the child
+	     and calls fuse_session_exit().
+	   - The kernel closes the FUSE device (e.g. forced unmount). */
 	fuse_session_loop(ch.session);
 
-	/* ==================================================================
-	 * Step 11 – Wait for the child to finish
-	 *
-	 * If the loop exited due to SIGINT/SIGTERM the child may still be
-	 * alive.  Give it a 2-second grace period before escalating.
-	 * ================================================================== */
+	/* Wait for the child to finish:
+	   If the loop exited due to SIGINT/SIGTERM the child may still be
+	   alive.  Give it a 2-second grace period before escalating. */
 	if (!g_child_done) {
 		int status;
 		pid_t reaped;
@@ -604,22 +580,23 @@ int main(int argc, char *argv[])
 
 	exit_code = (int)g_exit_status;
 
-	/* ==================================================================
-	 * Step 12 – Teardown
-	 *
-	 * Unmount bind mounts first (they sit on top of the FUSE filesystem).
-	 * Then destroy squashfuse state and unmount FUSE itself.
-	 *
-	 * lazy_umount (MNT_DETACH) is used throughout so that any lingering
-	 * processes (the user's command may have spawned children) do not
-	 * prevent the unmount from proceeding.
-	 *
-	 * It is harmless to call lazy_umount on a path that was never
-	 * mounted; umount2 will return EINVAL which we silently ignore.
-	 * ================================================================== */
+	/* Teardown:
+	   Unmount bind mounts first (they sit on top of the FUSE filesystem).
+	   Then destroy squashfuse state and unmount FUSE itself.
+
+	   lazy_umount (MNT_DETACH) is used throughout so that any lingering
+	   processes (the user's command may have spawned children) do not
+	   prevent the unmount from proceeding.
+
+	   It is harmless to call lazy_umount on a path that was never
+	   mounted; umount2 will return EINVAL which we silently ignore. */
  out_unmount:
 	for (int i = 0; i < sizeof(bmounts) / sizeof(bmounts[0]); ++i) {
 		char dst[PATH_MAX];
+		int is_root = !strcmp(bmounts[i], "/root");
+		if (is_root && binconfig.disable_home) continue;
+		if (!is_root && binconfig.disable_x11 && !strcmp(bmounts[i], "/tmp/.X11-unix"))
+			continue;
 		snprintf(dst, sizeof(dst), "%s/%s", mountpoint, bmounts[i]);
 		lazy_umount(dst);
 	}
@@ -627,6 +604,7 @@ int main(int argc, char *argv[])
 	sqfs_ll_destroy(ll);
 	sqfs_ll_unmount(&ch, mountpoint);
 	free(ll);
+	rmdir(mountpoint);
 
 	return exit_code;
 }
