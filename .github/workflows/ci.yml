@@ -62,20 +62,23 @@ jobs:
           export STAGE=1
           EOF
           CONFIG=./config utils/setup-rootfs.sh
-          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse || cat /home/runner/work/fatpaq/fatpaq/sabotage/logs/build_squashfuse.log
+          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse || cat /home/runner/work/fatpaq/fatpaq/sabotage/logs/*.log
 
       - name: Build fatpaq
         shell: bash
         run: |
           set -euxo pipefail
+          export R="$MUSL_PREFIX"
+          export PKG_CONFIG_SYSROOT_DIR="$R"
+          export PKG_CONFIG_LIBDIR="$R"/lib/pkgconfig
           make CC="$CC_CMD"
           make pack
+          zx -9 launcher
 
       - name: Upload launcher artifact
         uses: actions/upload-artifact@v4
         with:
-          name: launcher
+          name: launcher.xz
           path: |
-            launcher
             launcher.xz
           if-no-files-found: error
