@@ -52,7 +52,9 @@ jobs:
           export K="\$S"/KEEP
           export C="\$S"/tarballs
           export LOGPATH="\$S"/logs
-          export MAKE_THREADS=4
+          export PKG_CONFIG_SYSROOT_DIR="\$R"
+          export PKG_CONFIG_LIBDIR="\$R"/lib/pkgconfig
+          export MAKE_THREADS=8
           export CC="$CC_CMD"
           export HOSTCC="\$CC"
           export BUTCH_BUILD_TEMPLATE="\$K"/butch_build_template.txt
