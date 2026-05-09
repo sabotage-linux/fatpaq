@@ -1,7 +1,10 @@
 name: CI
 
-'on':
+on:
   push:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -28,8 +31,11 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt update
-          if ! sudo apt install -y musl-tools upx-ucl; then
-            sudo apt install -y musl-tools upx
+          sudo apt install -y musl-tools
+          echo "Attempting to install UPX via upx-ucl"
+          if ! sudo apt install -y upx-ucl; then
+            echo "upx-ucl unavailable, attempting to install UPX via upx"
+            sudo apt install -y upx
           fi
 
       - name: Build sabotage dependencies
