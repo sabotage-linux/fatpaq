@@ -522,6 +522,7 @@ int main(int argc, char *argv[])
 			_exit(127);
 		}
 		setenv("HOME", "/root", 1);
+		setenv("TMPDIR", "/dev/shm", 1);
 
 		/* Exec the requested command. */
 		argv[0] = binconfig.command;
