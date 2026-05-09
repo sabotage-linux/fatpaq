@@ -46,6 +46,7 @@ jobs:
           git clone --depth=1 https://github.com/sabotage-linux/sabotage
           cd sabotage
           cp KEEP/config.stage1 config
+          sed -i "s|^export S=.*$|export S=\"$PWD\"|" config
           sed -i "s|^export R=.*$|export R=\"$MUSL_PREFIX\"|" config
           printf 'CC="%s"\nHOSTCC="$CC"\nexport CC HOSTCC\n' "$CC_CMD" >> config
           CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install fuse zstd squashfuse
