@@ -45,11 +45,20 @@ jobs:
           mkdir -p "$MUSL_PREFIX"
           git clone --depth=1 https://github.com/sabotage-linux/sabotage
           cd sabotage
-          cp KEEP/config.stage1 config
-          sed -i "s|^export S=.*$|export S=\"$PWD\"|" config
-          sed -i "s|^export R=.*$|export R=\"$MUSL_PREFIX\"|" config
-          printf 'CC="%s"\nHOSTCC="$CC"\nexport CC HOSTCC\n' "$CC_CMD" >> config
-          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install fuse zstd squashfuse
+          cat > config <<EOF
+          export A=x86_64
+          export R="$MUSL_PREFIX"
+          export S="$PWD"
+          export K="\$S"/KEEP
+          export C="\$S"/tarballs
+          export MAKE_THREADS=4
+          export CC="$CC_CMD"
+          export HOSTCC="\$CC"
+          export BUTCH_BUILD_TEMPLATE="\$K"/butch_build_template.txt
+          export BUTCH_DOWNLOAD_TEMPLATE="\$K"/butch_download_template.txt
+          export STAGE=1
+          EOF
+          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse
 
       - name: Build fatpaq
         shell: bash
