@@ -58,6 +58,7 @@ jobs:
           export BUTCH_DOWNLOAD_TEMPLATE="\$K"/butch_download_template.txt
           export STAGE=1
           EOF
+          CONFIG=./config utils/setup-rootfs.sh
           CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse
 
       - name: Build fatpaq
