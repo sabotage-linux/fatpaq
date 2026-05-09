@@ -16,6 +16,10 @@ fi
 outfile=$1
 shift
 
+get_interp() {
+LC_ALL=C readelf -l "$1" | awk '/program interpreter/ { sub(/^.*: /, "", $0); sub(/\]$/, "", $0); print }'
+}
+
 tmp=${outfile}.tmp.$$
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 
@@ -67,3 +71,4 @@ else
 fi
 
 mv -f "$tmp" "$outfile"
+get_interp "$(head -n 1 "$outfile")" >> "$outfile"
