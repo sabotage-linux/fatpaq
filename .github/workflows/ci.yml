@@ -51,27 +51,34 @@ jobs:
           export S="$PWD"
           export K="\$S"/KEEP
           export C="\$S"/tarballs
-          export MAKE_THREADS=4
+          export LOGPATH="\$S"/logs
+          export PKG_CONFIG_SYSROOT_DIR="\$R"
+          export PKG_CONFIG_LIBDIR="\$R"/lib/pkgconfig
+          export MAKE_THREADS=8
           export CC="$CC_CMD"
           export HOSTCC="\$CC"
           export BUTCH_BUILD_TEMPLATE="\$K"/butch_build_template.txt
           export BUTCH_DOWNLOAD_TEMPLATE="\$K"/butch_download_template.txt
           export STAGE=1
           EOF
-          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse
+          CONFIG=./config utils/setup-rootfs.sh
+          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse || cat /home/runner/work/fatpaq/fatpaq/sabotage/logs/*.log
 
       - name: Build fatpaq
         shell: bash
         run: |
           set -euxo pipefail
+          export R="$MUSL_PREFIX"
+          export PKG_CONFIG_SYSROOT_DIR="$R"
+          export PKG_CONFIG_LIBDIR="$R"/lib/pkgconfig
           make CC="$CC_CMD"
           make pack
+          xz -9 launcher
 
       - name: Upload launcher artifact
         uses: actions/upload-artifact@v4
         with:
-          name: launcher
+          name: launcher.xz
           path: |
-            launcher
             launcher.xz
           if-no-files-found: error
