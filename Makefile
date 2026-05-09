@@ -16,10 +16,10 @@ LDFLAGS ?= -Wl,--gc-sections -Wl,-z,relro,-z,now -Wl,-z,text -s -static
 all: $(PROGS)
 
 makeapp: makeapp.c
-	gcc $^ -O0 -o $@
+	$(CC) $^ -O0 -o $@
 
 launcher: launcher.c
-	gcc $^ -o $@ $(FCFLAGS) $(CFLAGS) $(FLFLAGS) $(LDFLAGS) -lzstd -lm -lpthread
+	$(CC) $^ -o $@ $(FCFLAGS) $(CFLAGS) $(FLFLAGS) $(LDFLAGS) -lzstd -lm -lpthread
 
 pack: launcher
 	upx -9 --ultra-brute launcher
