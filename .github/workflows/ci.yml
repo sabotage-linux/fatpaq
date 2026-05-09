@@ -51,6 +51,7 @@ jobs:
           export S="$PWD"
           export K="\$S"/KEEP
           export C="\$S"/tarballs
+          export LOGPATH="\$S"/logs
           export MAKE_THREADS=4
           export CC="$CC_CMD"
           export HOSTCC="\$CC"
