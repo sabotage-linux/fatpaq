@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo "MUSL_PREFIX=$GITHUB_WORKSPACE/musl-prefix"
+            echo 'CC_CMD<<EOF'
+            echo "musl-gcc -I$GITHUB_WORKSPACE/musl-prefix/include -L$GITHUB_WORKSPACE/musl-prefix/lib"
+            echo EOF
+            echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/musl-prefix/lib/pkgconfig:$GITHUB_WORKSPACE/musl-prefix/share/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt update
+          sudo apt install -y musl-tools
+          echo "Attempting to install UPX via upx-ucl"
+          if ! sudo apt install -y upx-ucl; then
+            echo "upx-ucl unavailable, attempting to install UPX via upx"
+            sudo apt install -y upx
+          fi
+
+      - name: Build sabotage dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MUSL_PREFIX"
+          git clone --depth=1 https://github.com/sabotage-linux/sabotage
+          cd sabotage
+          cat > config <<EOF
+          export A=x86_64
+          export R="$MUSL_PREFIX"
+          export S="$PWD"
+          export K="\$S"/KEEP
+          export C="\$S"/tarballs
+          export MAKE_THREADS=4
+          export CC="$CC_CMD"
+          export HOSTCC="\$CC"
+          export BUTCH_BUILD_TEMPLATE="\$K"/butch_build_template.txt
+          export BUTCH_DOWNLOAD_TEMPLATE="\$K"/butch_download_template.txt
+          export STAGE=1
+          EOF
+          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install musl kernel-headers zstd fuse squashfuse
+
+      - name: Build fatpaq
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make CC="$CC_CMD"
+          make pack
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher
+          path: |
+            launcher
+            launcher.xz
+          if-no-files-found: error
