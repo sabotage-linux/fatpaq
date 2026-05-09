@@ -73,7 +73,7 @@ jobs:
           export PKG_CONFIG_LIBDIR="$R"/lib/pkgconfig
           make CC="$CC_CMD"
           make pack
-          zx -9 launcher
+          xz -9 launcher
 
       - name: Upload launcher artifact
         uses: actions/upload-artifact@v4
