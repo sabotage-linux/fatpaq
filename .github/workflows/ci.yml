@@ -1,0 +1,61 @@
+name: CI
+
+'on':
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo "MUSL_PREFIX=$GITHUB_WORKSPACE/musl-prefix"
+            echo 'CC_CMD<<EOF'
+            echo "musl-gcc -I$GITHUB_WORKSPACE/musl-prefix/include -L$GITHUB_WORKSPACE/musl-prefix/lib"
+            echo EOF
+            echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/musl-prefix/lib/pkgconfig:$GITHUB_WORKSPACE/musl-prefix/share/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt update
+          if ! sudo apt install -y musl-tools upx-ucl; then
+            sudo apt install -y musl-tools upx
+          fi
+
+      - name: Build sabotage dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MUSL_PREFIX"
+          git clone --depth=1 https://github.com/sabotage-linux/sabotage
+          cd sabotage
+          cp KEEP/config.stage1 config
+          sed -i "s|^export R=.*$|export R=\"$MUSL_PREFIX\"|" config
+          printf 'CC="%s"\nHOSTCC="$CC"\nexport CC HOSTCC\n' "$CC_CMD" >> config
+          CONFIG=./config option_squashfuse_zstd_only=1 KEEP/bin/butch install fuse zstd squashfuse
+
+      - name: Build fatpaq
+        shell: bash
+        run: |
+          set -euxo pipefail
+          make CC="$CC_CMD"
+          make pack
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher
+          path: |
+            launcher
+            launcher.xz
+          if-no-files-found: error
